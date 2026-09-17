@@ -1,0 +1,101 @@
+# Configuración central de la estrategia. Todo lo que gobierna el
+# comportamiento del bot (símbolos, timeframes, parámetros de indicadores,
+# riesgo y ejecución) vive aquí para poder ajustarlo sin tocar código.
+
+exchange:
+  name: binance
+  market_type: spot        # spot | future
+
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+
+timeframes:
+  primary: 1h               # timeframe donde se determina tendencia/momentum
+  confirmation: 15m         # timeframe usado para confirmar el timing de entrada
+  primary_candles: 200      # velas históricas a descargar (suficientes para EMA200)
+  confirmation_candles: 100
+
+signal:
+  provider: technical_analysis   # proveedor activo (ver signal_layer)
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  ema_fast: 50
+  ema_slow: 200
+  atr_period: 14
+  support_resistance_lookback: 20
+  min_confidence: 0.6            # confianza mínima para considerar la señal accionable
+
+risk:
+  risk_per_trade_pct: 0.02       # máximo 2% del capital arriesgado por trade
+  stop_loss_method: atr          # atr | fixed_pct
+  atr_multiplier: 1.5
+  fixed_stop_loss_pct: 0.02
+  risk_reward_ratio: 2.0         # take profit = riesgo * ratio (1:2 por defecto)
+  max_position_pct_of_capital: 0.5   # tope de exposición por posición
+  max_consecutive_losses: 3      # circuit breaker: se detiene tras superar este nº de pérdidas seguidas
+
+execution:
+  poll_interval_seconds: 60
+  order_type: market
+  slippage_tolerance_pct: 0.005
+  max_open_positions: 2
+
+api:
+  max_retries: 3
+  retry_backoff_seconds: 2
+
+# Proveedor de señales opcional basado en un LLM servido por Venice.ai.
+# Desactivado por defecto: mientras enabled=false el bot usa únicamente
+# TechnicalAnalysisProvider. Si lo activas, Venice.ai solo decide dirección
+# (LONG/SHORT/HOLD) y confianza — el stop loss/take profit/tamaño de posición
+# los sigue calculando risk_layer.
+#
+# model: kimi-k2-5, verificado contra GET /v1/models Y con llamadas reales
+# exitosas (2026-09-17) usando el prompt real de este bot.
+#
+# IMPORTANTE sobre max_tokens: kimi-k2-5 es un modelo "reasoning" que gasta
+# tokens de salida en pensamiento interno (facturados igual que el texto
+# visible) ANTES de escribir el JSON. Con max_tokens=500 (valor por defecto
+# razonable para un modelo no-reasoning) el modelo agotaba el presupuesto
+# pensando y devolvía contenido VACÍO en el 100% de las pruebas — habría
+# fallado silenciosamente a TechnicalAnalysisProvider en cada llamada, sin
+# usar Venice ni una vez, gastando crédito igual. Se necesitaron 2000 tokens
+# para obtener JSON completo y parseable de forma consistente (~1500-1600 se
+# van en razonamiento oculto, ~70-130 en el JSON visible).
+#
+# Costo real medido con max_tokens=2000: ~$0.0064/llamada (~1290 tokens de
+# entrada + ~1600 de salida, a $0.56/$3.50 por millón entrada/salida). Con
+# la cadencia de start_bot.py ("60 min", ~48 llamadas/día entre BTC y ETH
+# sin posición abierta) sale ~$0.31/día → ~$9.2/mes: $10 de crédito rinden
+# ~32 días de corrida continua.
+#
+# openai-gpt-6-astra también se probó y funciona con max_tokens=500 sin
+# este problema (usa menos tokens de razonamiento para este prompt), pero
+# con el MISMO prompt real costó ~$0.023/llamada (~$1.10/día) — $10 se
+# agotarían en ~9 días. Se descartó por ahora por no encajar con la fase de
+# validación en paper trading antes de pasar a dinero real.
+#
+# IMPORTANTE sobre cadencia: este costo asume start_bot.py. Si se activa
+# venice.enabled sin pasar por start_bot.py, el default de abajo
+# (execution.poll_interval_seconds: 60, es decir 60 SEGUNDOS) multiplicaría
+# el costo por ~60x — usa siempre start_bot.py con Venice activo.
+venice:
+  enabled: true
+  api_url: https://api.venice.ai/api/v1/chat/completions
+  model: kimi-k2-5
+  temperature: 0.2
+  max_tokens: 2000
+  timeout_seconds: 30
+  max_retries: 2
+  history_window: 10             # nº de trades recientes incluidos en el prompt
+  context_file: logs/venice_context.json
+
+logging:
+  log_dir: logs
+  trades_log_file: trades.jsonl
+  level: INFO
