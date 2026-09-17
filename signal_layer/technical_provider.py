@@ -64,6 +64,7 @@ class TechnicalAnalysisProvider(BaseSignalProvider):
         self.atr_period = cfg["atr_period"]
         self.sr_lookback = cfg["support_resistance_lookback"]
         self.min_confidence = cfg["min_confidence"]
+        self.neutral_band = cfg.get("neutral_band", 0.10)
         self.primary_tf = config["timeframes"]["primary"]
         self.confirmation_tf = config["timeframes"]["confirmation"]
 
@@ -161,6 +162,10 @@ class TechnicalAnalysisProvider(BaseSignalProvider):
         if confirm["macd_hist"] < 0 and confirm["rsi"] > self.rsi_oversold:
             short_score += 0.25
             reasons.append("confirmación 15m alineada a la baja")
+
+        if abs(long_score - short_score) < self.neutral_band and long_score > 0 and short_score > 0:
+            reasons.append(f"señales contradictorias (long {long_score:.2f} vs short {short_score:.2f}): posición neutral")
+            return SignalDirection.NONE, 0.0, reasons
 
         if long_score >= short_score:
             return SignalDirection.LONG, round(long_score, 2), reasons

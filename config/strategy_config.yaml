@@ -16,8 +16,18 @@ timeframes:
   primary_candles: 200      # velas históricas a descargar (suficientes para EMA200)
   confirmation_candles: 100
 
+# Regímenes de mercado (signal_layer/regime.py). El bot detecta en cada ciclo
+# si el mercado está en tendencia o en rango y adapta la estrategia usada:
+# en tendencia -> Donchian breakout (validado: +1107% / +83% APY walk-forward);
+# en rango/débil -> scoring técnico tradicional con banda neutra.
+regime:
+  adx_period: 14
+  adx_threshold: 25          # ADX >= umbral => mercado en tendencia
+  atr_pct_high: 0.015        # ATR%/precio por encima de esto => volatilidad alta
+  momentum_period: 12        # velas para medir momentum reciente
+
 signal:
-  provider: technical_analysis   # proveedor activo (ver signal_layer)
+  provider: composite_analysis   # proveedor activo (ver signal_layer)
   rsi_period: 14
   rsi_oversold: 30
   rsi_overbought: 70
@@ -28,7 +38,17 @@ signal:
   ema_slow: 200
   atr_period: 14
   support_resistance_lookback: 20
-  min_confidence: 0.6            # confianza mínima para considerar la señal accionable
+  min_confidence: 0.45           # confianza mínima para considerar la señal accionable
+  neutral_band: 0.10             # si |long_score - short_score| < banda => NONE (no forzar dirección)
+
+# Estrategia Donchian breakout (signal_layer/donchian_provider.py):
+# ruptura de los extremos de N velas anteriores + filtro de tendencia EMA.
+donchian:
+  enabled: true
+  entry_lookback: 20
+  ema_trend: 200
+  ema_rise_bars: 20           # la EMA larga debe estar subiendo en estas velas
+  confidence_floor: 0.6
 
 risk:
   risk_per_trade_pct: 0.02       # máximo 2% del capital arriesgado por trade
@@ -38,9 +58,23 @@ risk:
   risk_reward_ratio: 2.0         # take profit = riesgo * ratio (1:2 por defecto)
   max_position_pct_of_capital: 0.5   # tope de exposición por posición
   max_consecutive_losses: 3      # circuit breaker: se detiene tras superar este nº de pérdidas seguidas
+  # Trailing stop (validado: es una de las pocas salidas con win-rate 100% en
+  # postmortems). Se activa solo después de que el precio avanza a favor.
+  trail_enabled: true
+  trail_atr_multiplier: 2.0      # distancia del trailing = ATR * multiplicador
+  # Sizing dinámico: escala el tamaño de la posición por la confianza de la
+  # señal (mayor confianza -> mayor tamaño, siempre dentro del tope de exposición).
+  confidence_sizing: true
+  confidence_cap: 1.5            # multiplicador máximo aplicado por confianza
 
 execution:
   poll_interval_seconds: 60
+  # Polling dinámico: en lugar de esperar fijo hasta que "se cumpla una
+  # condición", el bot re-evalúa más rápido en mercado volátil/en tendencia y
+  # más lento cuando está tranquilo. Si dynamic_poll=false usa el intervalo fijo.
+  dynamic_poll: true
+  min_poll_seconds: 15
+  max_poll_seconds: 900
   order_type: market
   slippage_tolerance_pct: 0.005
   max_open_positions: 2

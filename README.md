@@ -17,12 +17,20 @@ trading_bot/
 │   └── models.py                    # MarketData
 ├── signal_layer/
 │   ├── base_provider.py             # BaseSignalProvider (contrato) + Signal
-│   └── technical_provider.py        # TechnicalAnalysisProvider (RSI+MACD+EMA+S/R)
+│   ├── regime.py                    # detección de régimen de mercado (ADX/ATR)
+│   ├── technical_provider.py        # TechnicalAnalysisProvider (RSI+MACD+EMA+S/R)
+│   ├── donchian_provider.py         # ruptura Donchian + filtro EMA (validado)
+│   ├── composite_provider.py        # elige estrategia según el régimen en cada ciclo
+│   └── venice_provider.py           # decisión LLM con contexto real-time + fallback
 ├── risk_layer/
-│   └── risk_manager.py              # position sizing, SL/TP, circuit breaker
+│   ├── risk_manager.py              # position sizing, SL/TP, trailing, circuit breaker
+│   └── campaign_tracker.py          # circuit breaker a nivel de campaña
 ├── execution_layer/
-│   ├── order_manager.py             # apertura/cierre de posiciones
+│   ├── order_manager.py             # apertura/cierre de posiciones + trailing stop
 │   └── models.py                    # Position
+├── backtest/
+│   ├── data.py                      # generador de datos sintéticos OFFLINE
+│   └── engine.py                    # backtester sin red ni API
 └── utils/
     └── logger.py                    # log JSONL + dashboard + reporte CSV/HTML
 ```
@@ -32,15 +40,32 @@ modelo de ML, sentiment, etc.) se añade creando una clase que hereda de
 `BaseSignalProvider` e implementa `generate_signal(market_data) -> Signal`.
 Ni `risk_layer` ni `execution_layer` necesitan cambios.
 
-## Estrategia
+## Estrategia (adaptativa por régimen)
 
-- Timeframe principal **1h** (tendencia vía EMA50/EMA200 + momentum RSI/MACD),
-  confirmado con **15m**.
-- Riesgo máximo **2% del capital** por operación (`risk.risk_per_trade_pct`).
+El bot NO espera pasivamente a que "todas las condiciones de una señal se
+cumplan": en cada ciclo detecta el **régimen de mercado** (ADX/ATR) y adapta
+la decisión en ese momento:
+
+- **Mercado en tendencia** → estrategia Donchian breakout (ruptura de
+  extremos de N velas + filtro EMA200, validada con walk-forward: +1,107% /
+  +83% APY en BTC 4H) — primada por el compuesto.
+- **Mercado en rango** → scoring técnico clásico (tendencia EMA + RSI/MACD +
+  soporte/resistencia) con banda neutra (no fuerza dirección si las señales
+  se contradicen).
+- **Ritmo dinámico**: `execution.dynamic_poll` re-evalúa más rápido cuando el
+  mercado está volátil o en tendencia y más lento cuando está tranquilo.
 - Stop loss configurable: **ATR** (`atr_multiplier x ATR14`) o **porcentaje fijo**.
-- Take profit con ratio riesgo:beneficio configurable (**1:2** por defecto).
-- **Circuit breaker**: el bot deja de operar si acumula más de 3 pérdidas
-  consecutivas (`risk.max_consecutive_losses`), hasta que se reinicie manualmente.
+- Take profit con ratio riesgo:beneficio (**1:2** por defecto).
+- **Trailing stop** (`risk.trail_enabled`): avanza el SL a favor de la
+  posición tras superar `trail_atr_multiplier x ATR` — validación empírica:
+  las salidas por trailing/TP son de las pocas con win-rate alto en los
+  postmortems públicos; salir por "señal opuesta" es el patrón que más dinero
+  pierde.
+- **Sizing dinámico**: el tamaño de la posición se escala con la confianza de
+  la señal (`risk.confidence_sizing`), mayor en tendencia, menor en rango,
+  siempre dentro del tope de exposición.
+- **Circuit breaker por racha**: el bot deja de operar tras superar
+  `risk.max_consecutive_losses` pérdidas seguidas.
 - Todos los parámetros están en [config/strategy_config.yaml](config/strategy_config.yaml).
 
 ## Instalación
@@ -124,6 +149,32 @@ python main.py --report
 
 Esto produce `report.csv` y `report.html` con todas las operaciones cerradas.
 
+Validar la configuración actual del bot con datos sintéticos (sin red, sin
+API, sin créditos de LLM):
+
+```bash
+python main.py --backtest
+```
+
+Ejecuta el pipeline real (señal adaptativa -> riesgo -> SL/TP/trailing) sobre
+varias series sintéticas y muestra rentabilidad, win rate, profit factor, max
+drawdown y Sharpe. Sirve de *smoke test* de robustez ANTES de activar
+testnet/producción.
+
+## Tests (100% offline)
+
+No usan la red de Binance ni la API de Venice (ni créditos):
+
+```bash
+venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Cubren: detección de régimen, los tres proveedores (técnico, Donchian,
+compuesto), RiskManager (sizing, circuit breaker, trailing), OrderManager
+(cierre SL/TP y trailing), parsing robusto del JSON del LLM y su fallback
+(monkeypatch de la llamada), el backtester y el flujo completo de `main.py`
+con un cliente fake.
+
 ## Proveedor de señales opcional: Venice.ai (LLM)
 
 Además de `TechnicalAnalysisProvider`, existe `signal_layer/venice_provider.py`:
@@ -132,11 +183,16 @@ decida LONG/SHORT/HOLD, usando los indicadores técnicos (RSI, MACD, EMA,
 soporte/resistencia) como contexto del prompt.
 
 - **Desactivado por defecto** (`venice.enabled: false` en `strategy_config.yaml`).
-- Venice solo aporta **dirección y confianza**; el stop loss, take profit y
-  tamaño de posición los sigue calculando siempre `RiskManager` (2% de
-  riesgo, ATR, ratio 1:2) — igual que con cualquier otro proveedor.
+- Venice solo aporta **dirección y confianza**; el stop loss, take profit,
+  trailing y tamaño de posición los sigue calculando siempre `RiskManager`
+  (riesgo configurado, ATR, ratio, trailing) — igual que con cualquier otro
+  proveedor.
+- Venice recibe contexto del **momento exacto**: régimen, ADX, volatilidad
+  (ATR% del precio), momentum y order book (bid/ask/spread) en el prompt de
+  cada ciclo.
 - Si la llamada a Venice falla, da timeout o responde algo no parseable, el
-  bot cae automáticamente a `TechnicalAnalysisProvider` para ese ciclo.
+  bot cae automáticamente al **proveedor compuesto adaptativo** para ese
+  ciclo.
 - Mantiene un contexto persistido (`venice.context_file`, por defecto
   `logs/venice_context.json`) con el historial de resultados, ya que el
   modelo no tiene memoria entre llamadas: cada prompt incluye win rate,
@@ -175,8 +231,9 @@ USD or Diem balance` al llamar al modelo — la key es válida y la conexión
 funciona, pero necesita crédito cargado en
 [venice.ai/settings/api](https://venice.ai/settings/api) antes de que
 cualquier modelo responda. Hasta entonces, `VeniceSignalProvider` seguirá
-cayendo automáticamente a `TechnicalAnalysisProvider` en cada ciclo (así lo
-verás en `logs/trades.jsonl`: `"source": "fallback_technical"`).
+cayendo automáticamente al proveedor compuesto adaptativo en cada ciclo (así
+lo verás en `logs/trades.jsonl` con el proveedor de respaldo, o
+`"source": "fallback_technical"` en caso de que el respaldo sea el técnico).
 
 ## Pasar a producción
 
@@ -187,10 +244,14 @@ verás en `logs/trades.jsonl`: `"source": "fallback_technical"`).
 
 ## Notas de diseño
 
-- El stop loss / take profit se gestionan por *polling* (comparando el precio
-  de cada ciclo contra los niveles calculados), no con una OCO nativa del
-  exchange, para mantener el código simple y portable. Para uso intensivo en
-  producción se recomienda migrar a órdenes OCO/bracket nativas de Binance.
+- El stop loss / take profit / trailing stop se gestionan por *polling*
+  (comparando el precio de cada ciclo contra los niveles calculados), no con
+  una OCO nativa del exchange, para mantener el código simple y portable. Para
+  uso intensivo en producción se recomienda migrar a órdenes OCO/bracket
+  nativas de Binance.
+- El polling es **dinámico**: el bot acelera la consulta en mercados volátiles
+  o con tendencia y la ralentiza cuando está tranquilo (tiempo muerto en
+  mercado vivo, no "esperamos a que pase algo").
 - Los reintentos ante errores de red/API usan backoff exponencial (`tenacity`),
   configurables en `api.max_retries` / `api.retry_backoff_seconds`.
 # AI_Trading_Agent

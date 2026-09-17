@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from data_layer.models import MarketData
 from signal_layer.base_provider import BaseSignalProvider, Signal, SignalDirection
+from signal_layer.regime import classify
 from signal_layer.technical_provider import TechnicalAnalysisProvider
 
 logger = logging.getLogger("trading_bot")
@@ -38,10 +40,48 @@ ACTION_TO_DIRECTION = {
 }
 
 
+def _extract_json_object(content: str) -> str:
+    """Extrae el primer objeto JSON balanceado ({...}) de un texto que puede
+    incluir markdown, texto antes/después o múltiples objetos. Robusto contra
+    respuestas del LLM que añaden comentarios."""
+    start = content.find("{")
+    if start == -1:
+        raise ValueError("sin objeto JSON en la respuesta")
+    depth = 0
+    for i in range(start, len(content)):
+        ch = content[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start:i + 1]
+    raise ValueError("objeto JSON sin cerrar")
+
+
+def parse_decision(content: str) -> dict:
+    """Convierte la respuesta cruda del modelo en un dict normalizado
+    {action, confidence, reasoning}. Indep de la red: testeable offline."""
+    raw = content.strip()
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    obj = json.loads(_extract_json_object(raw))
+    action = str(obj.get("action", "HOLD")).upper()
+    if action not in ACTION_TO_DIRECTION:
+        action = "HOLD"
+    try:
+        confidence = float(obj.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    reasoning = str(obj.get("reasoning", ""))
+    return {"action": action, "confidence": confidence, "reasoning": reasoning}
+
+
 class VeniceSignalProvider(BaseSignalProvider):
     name = "venice"
 
-    def __init__(self, config: dict, api_key: str, technical_fallback: TechnicalAnalysisProvider):
+    def __init__(self, config: dict, api_key: str, technical_fallback: TechnicalAnalysisProvider,
+                 fallback_provider=None):
         cfg = config["venice"]
         self.api_key = api_key
         self.api_url = cfg["api_url"]
@@ -54,8 +94,10 @@ class VeniceSignalProvider(BaseSignalProvider):
         self.min_confidence = config["signal"]["min_confidence"]
 
         self.technical = technical_fallback
+        self.fallback_provider = fallback_provider
         self.primary_tf = config["timeframes"]["primary"]
         self.confirmation_tf = config["timeframes"]["confirmation"]
+        self.adx_threshold = config["regime"]["adx_threshold"]
 
         self.context_path = Path(cfg.get("context_file", "logs/venice_context.json"))
         self.context_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,11 +135,13 @@ class VeniceSignalProvider(BaseSignalProvider):
             return await self._generate_via_venice(market_data)
         except Exception:
             logger.exception(
-                "Venice falló generando señal para %s, usando TechnicalAnalysisProvider como respaldo",
+                "Venice falló generando señal para %s, usando respaldo automático",
                 market_data.symbol,
             )
-            fallback = await self.technical.generate_signal(market_data)
-            fallback.metadata["source"] = "fallback_technical"
+            fallback_provider = self.fallback_provider or self.technical
+            fallback = await fallback_provider.generate_signal(market_data)
+            if fallback_provider is self.technical:
+                fallback.metadata["source"] = "fallback_technical"
             return fallback
 
     async def _generate_via_venice(self, market_data: MarketData) -> Signal:
@@ -105,10 +149,17 @@ class VeniceSignalProvider(BaseSignalProvider):
         df_confirm = market_data.candles(self.confirmation_tf)
         primary = self.technical.analyze_timeframe(df_primary)
         confirm = self.technical.analyze_timeframe(df_confirm)
+        regime = classify(df_primary, adx_threshold=self.adx_threshold)
         price = float(df_primary["close"].iloc[-1])
 
-        prompt = self._build_prompt(market_data.symbol, price, primary, confirm)
-        decision = await self._call_venice(prompt)
+        order_book = market_data.order_book or {}
+        best_bid = float(order_book.get("bids", [[price]])[0][0])
+        best_ask = float(order_book.get("asks", [[price]])[0][0])
+        spread_pct = ((best_ask - best_bid) / price * 100) if price else 0.0
+
+        prompt = self._build_prompt(market_data.symbol, price, primary, confirm, regime, best_bid, best_ask, spread_pct)
+        content = await self._call_venice(prompt)
+        decision = parse_decision(content)
 
         direction = ACTION_TO_DIRECTION.get(str(decision.get("action", "HOLD")).upper(), SignalDirection.NONE)
         confidence = float(decision.get("confidence", 0.0))
@@ -117,6 +168,14 @@ class VeniceSignalProvider(BaseSignalProvider):
 
         metadata = {
             "atr": float(primary["atr"]),
+            "regime": regime.regime.value,
+            "adx": regime.adx,
+            "atr_pct": regime.atr_pct,
+            "high_volatility": regime.high_volatility,
+            "momentum_pct": regime.momentum_pct,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_pct": spread_pct,
             "trend": primary["trend"],
             "rsi_primary": float(primary["rsi"]),
             "rsi_confirmation": float(confirm["rsi"]),
@@ -138,7 +197,8 @@ class VeniceSignalProvider(BaseSignalProvider):
             metadata=metadata,
         )
 
-    def _build_prompt(self, symbol: str, price: float, primary: dict, confirm: dict) -> str:
+    def _build_prompt(self, symbol: str, price: float, primary: dict, confirm: dict,
+                      regime, best_bid: float, best_ask: float, spread_pct: float) -> str:
         total = self._context["total_trades"]
         wins = self._context["winning_trades"]
         win_rate = (wins / total * 100) if total else 0.0
@@ -157,17 +217,23 @@ HISTORIAL (resumen):
 - Últimos cierres:
 {recent_lines}
 
-MERCADO — {symbol}
+MERCADO — {symbol} (EN ESTE MOMENTO)
 Precio actual: {price:.2f}
+Order book: mejor bid {best_bid:.2f} | mejor ask {best_ask:.2f} | spread {spread_pct:.3f}%
 
-Timeframe principal (1h):
+RÉGIMEN DETECTADO AHORA MISMO:
+- Régimen: {regime.regime.value} (tendencia si ADX >= {self.adx_threshold})
+- ADX: {regime.adx:.1f}
+- Volatilidad ATR: {primary['atr']:.2f} ({regime.atr_pct:.2f}% del precio, {'ALTA' if regime.high_volatility else 'normal'})
+- Momentum último periodo: {regime.momentum_pct:+.2f}%
+
+Timeframe principal ({self.primary_tf}):
 - Tendencia: {primary['trend']}
 - RSI(14): {primary['rsi']:.1f}
 - MACD histograma: {primary['macd_hist']:.4f} (anterior: {primary['macd_hist_prev']:.4f})
 - Soporte: {primary['support']:.2f} | Resistencia: {primary['resistance']:.2f}
-- ATR(14): {primary['atr']:.2f}
 
-Timeframe de confirmación (15m):
+Timeframe de confirmación ({self.confirmation_tf}):
 - RSI(14): {confirm['rsi']:.1f}
 - MACD histograma: {confirm['macd_hist']:.4f}
 
@@ -176,11 +242,16 @@ salidas las gestiona automáticamente el sistema de riesgo vía stop loss/take p
 El tamaño de posición, stop loss y take profit los calcula un módulo de riesgo aparte
 en base al ATR — tú NO los definas, sólo evalúa dirección y confianza.
 
+No esperes a que "todas las condiciones se alineen": decide con la información
+de este momento. Si el régimen es de tendencia y hay momentum, LONG o SHORT según
+dirección. Si las señales son contradictorias o el mercado está sin dirección,
+responde HOLD. Ten en cuenta el win rate histórico para calibrar tu confianza.
+
 Responde ÚNICAMENTE con este JSON, sin texto adicional ni markdown:
 {{"action": "LONG" | "SHORT" | "HOLD", "confidence": 0.0-1.0, "reasoning": "explicación breve"}}
 """
 
-    async def _call_venice(self, prompt: str) -> dict:
+    async def _call_venice(self, prompt: str) -> str:
         payload = {
             "model": self.model,
             "messages": [
@@ -201,7 +272,7 @@ Responde ÚNICAMENTE con este JSON, sin texto adicional ni markdown:
         content = await decorated(payload, headers)
 
         content = content.replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
+        return content
 
     async def _post(self, payload: dict, headers: dict) -> str:
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)

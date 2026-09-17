@@ -18,6 +18,8 @@ class RiskDecision:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     risk_amount: float = 0.0
+    atr: float | None = None
+    trail_atr_multiplier: float | None = None
 
 
 class RiskManager:
@@ -30,6 +32,10 @@ class RiskManager:
         self.risk_reward_ratio = cfg["risk_reward_ratio"]
         self.max_position_pct_of_capital = cfg["max_position_pct_of_capital"]
         self.max_consecutive_losses = cfg["max_consecutive_losses"]
+        self.trail_enabled = cfg.get("trail_enabled", True)
+        self.trail_atr_multiplier = cfg.get("trail_atr_multiplier", 2.0)
+        self.confidence_sizing = cfg.get("confidence_sizing", True)
+        self.confidence_cap = cfg.get("confidence_cap", 1.5)
 
         self._recent_results: deque[str] = deque(maxlen=50)  # "win" | "loss"
         self.trading_halted = False
@@ -70,6 +76,31 @@ class RiskManager:
             return entry_price + reward
         return entry_price - reward
 
+    # --- trailing stop --------------------------------------------------------
+    def update_trailing_stop(self, current_price: float, entry_price: float,
+                             direction: SignalDirection, stop_loss: float,
+                             atr: float | None, trail_multiplier: float | None) -> float:
+        """Avanza el stop loss solo a favor de la posición (sin alejarlo nunca
+        de la entrada). Devuelve el stop actualizado o el mismo si no aplica.
+        Validación empírica: el trailing stop es una de las pocas salidas con
+        win-rate ~100% en los postmortems de estrategias de ruptura."""
+        if not self.trail_enabled or not trail_multiplier or trail_multiplier <= 0 or not atr or atr <= 0:
+            return stop_loss
+
+        distance = atr * trail_multiplier
+        if direction == SignalDirection.LONG:
+            # solo agarra ganancia si el precio subió al menos `distance` desde la entrada
+            if current_price < entry_price + distance:
+                return stop_loss
+            candidate = current_price - distance
+            return max(stop_loss, candidate)
+
+        # SHORT: el precio debe bajar al menos `distance` para armar el trailing
+        if current_price > entry_price - distance:
+            return stop_loss
+        candidate = current_price + distance
+        return min(stop_loss, candidate)
+
     # --- position sizing -------------------------------------------------------
     def calculate_position_size(self, capital: float, entry_price: float, stop_loss: float) -> float:
         risk_amount = capital * self.risk_per_trade_pct
@@ -83,6 +114,18 @@ class RiskManager:
             quantity = max_notional / entry_price
 
         return quantity
+
+    def confidence_multiplier(self, signal: Signal) -> float:
+        """Multiplicador de tamaño según la confianza de la señal. Usa el
+        `size_multiplier` que el proveedor adaptativo ya calculó por régimen
+        si existe; si no, deriva 1.0 de confianza máxima. Siempre en [0.25, cap]."""
+        if not self.confidence_sizing:
+            return 1.0
+        hint = signal.metadata.get("size_multiplier")
+        if hint is not None:
+            return max(0.25, min(float(hint), self.confidence_cap))
+        base = signal.confidence / 0.75 if signal.confidence > 0 else 0.0  # conf 0.75 -> 1.0
+        return max(0.25, min(base, self.confidence_cap))
 
     # --- punto de entrada usado por execution_layer -----------------------------
     def validate_and_size(self, signal: Signal, capital: float, open_positions: int,
@@ -100,11 +143,17 @@ class RiskManager:
         stop_loss = self.calculate_stop_loss(signal.price, signal.direction, atr)
         take_profit = self.calculate_take_profit(signal.price, stop_loss, signal.direction)
         quantity = self.calculate_position_size(capital, signal.price, stop_loss)
+        quantity *= self.confidence_multiplier(signal)
+
+        max_notional = capital * self.max_position_pct_of_capital
+        if quantity * signal.price > max_notional:
+            quantity = max_notional / signal.price
 
         if quantity <= 0:
             return RiskDecision(False, "tamaño de posición calculado es 0")
 
         risk_amount = capital * self.risk_per_trade_pct
+        trail_mult = self.trail_atr_multiplier if self.trail_enabled else None
 
         return RiskDecision(
             approved=True,
@@ -113,4 +162,6 @@ class RiskManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
             risk_amount=risk_amount,
+            atr=float(atr) if atr else None,
+            trail_atr_multiplier=trail_mult,
         )

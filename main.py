@@ -23,6 +23,8 @@ from execution_layer.order_manager import OrderManager, OrderValidationError
 from risk_layer.campaign_tracker import CampaignTracker
 from risk_layer.risk_manager import RiskManager
 from signal_layer.base_provider import BaseSignalProvider, SignalDirection
+from signal_layer.composite_provider import CompositeSignalProvider
+from signal_layer.regime import classify
 from signal_layer.technical_provider import TechnicalAnalysisProvider
 from utils.logger import TradeLogger, setup_logging
 
@@ -50,10 +52,13 @@ class TradingBot:
             log_dir=self.strategy["logging"]["log_dir"],
             filename=self.strategy["logging"]["trades_log_file"],
         )
-        self.order_manager = OrderManager(self.client, self.trade_logger, settings.trading_mode)
+        self.order_manager = OrderManager(
+            self.client, self.trade_logger, settings.trading_mode, risk_manager=self.risk_manager,
+        )
 
         self.capital = settings.initial_capital
         self.campaign = self._build_campaign_tracker()
+        self._market_state: dict[str, bool] = {"high_volatility": False, "trending": False}
         self._running = False
 
     def _build_campaign_tracker(self) -> CampaignTracker | None:
@@ -74,20 +79,22 @@ class TradingBot:
         )
 
     def _build_signal_provider(self) -> BaseSignalProvider:
-        """Instancia el proveedor de señales activo. TechnicalAnalysisProvider
-        es siempre la implementación por defecto; si `venice.enabled` está en
-        true en la config, se usa VeniceSignalProvider (que a su vez usa
-        TechnicalAnalysisProvider como fuente de indicadores y como respaldo
-        automático si la API de Venice falla)."""
+        """Instancia el proveedor de señales activo. Por defecto usa el
+        CompositeSignalProvider (adaptativo por régimen: Donchian en tendencia,
+        scoring técnico en rango). Si `venice.enabled` está en true se usa
+        VeniceSignalProvider, que consulta al LLM en CADA ciclo con el contexto
+        del momento y cae automáticamente al compuesto si la API falla."""
         technical = TechnicalAnalysisProvider(self.strategy)
+        composite = CompositeSignalProvider(self.strategy)
         if not self.strategy.get("venice", {}).get("enabled", False):
-            return technical
+            return composite
 
         from signal_layer.venice_provider import VeniceSignalProvider  # import diferido: opcional
 
         if not self.settings.venice_api_key:
             raise ValueError("venice.enabled=true pero falta VENICE_API_KEY en .env")
-        return VeniceSignalProvider(self.strategy, self.settings.venice_api_key, technical)
+        return VeniceSignalProvider(self.strategy, self.settings.venice_api_key, technical,
+                                    fallback_provider=composite)
 
     async def start(self) -> None:
         await self.client.connect()
@@ -105,8 +112,8 @@ class TradingBot:
 
         try:
             while self._running:
-                await self._run_cycle()
-                await asyncio.sleep(self.strategy["execution"]["poll_interval_seconds"])
+                interval = await self._run_cycle()
+                await asyncio.sleep(interval)
         finally:
             await self.client.close()
 
@@ -137,7 +144,7 @@ class TradingBot:
                 self.logger.info("Campaña '%s' detenida: %s", self.campaign.name, status.reason)
                 self.stop()
 
-    async def _run_cycle(self) -> None:
+    async def _run_cycle(self) -> float:
         for symbol in self.strategy["symbols"]:
             try:
                 await self._process_symbol(symbol)
@@ -145,6 +152,26 @@ class TradingBot:
                 self.logger.exception("Error procesando %s", symbol)
 
         self.trade_logger.print_dashboard()
+        return self._next_poll_seconds()
+
+    def _next_poll_seconds(self) -> float:
+        """Polling dinámico: el bot re-evalúa más rápido cuando el mercado está
+        volátil o en tendencia (donde el timing importa) y más lento cuando está
+        tranquilo. Así no 'espera pasivamente una condición': ajusta el ritmo a
+        la información del momento."""
+        exec_cfg = self.strategy["execution"]
+        base = float(exec_cfg.get("poll_interval_seconds", 60))
+        if not exec_cfg.get("dynamic_poll", True):
+            return base
+        min_poll = float(exec_cfg.get("min_poll_seconds", 15))
+        max_poll = float(exec_cfg.get("max_poll_seconds", 900))
+        if self._market_state.get("high_volatility"):
+            interval = base / 4
+        elif self._market_state.get("trending"):
+            interval = base / 2
+        else:
+            interval = base
+        return max(min_poll, min(max_poll, interval))
 
     async def _process_symbol(self, symbol: str) -> None:
         tf = self.strategy["timeframes"]
@@ -152,6 +179,18 @@ class TradingBot:
             symbol, tf["primary"], tf["confirmation"], tf["primary_candles"], tf["confirmation_candles"],
         )
         current_price = market_data.last_price
+
+        try:
+            regime = classify(
+                market_data.candles(tf["primary"]),
+                adx_threshold=self.strategy["regime"]["adx_threshold"],
+            )
+            self._market_state = {
+                "high_volatility": regime.high_volatility,
+                "trending": regime.trending,
+            }
+        except Exception:
+            pass  # si no se puede clasificar, se conserva el último estado conocido
 
         # 1. Gestionar salidas de posiciones abiertas antes de buscar nuevas entradas
         closed = await self.order_manager.check_exit_conditions(
@@ -212,6 +251,22 @@ def _generate_report(settings: Settings) -> None:
     print("Reporte generado: report.csv, report.html")
 
 
+def _run_backtest_cli(settings: Settings) -> None:
+    """Valida la configuración actual del bot con datos sintéticos OFFLINE
+    (sin API real ni créditos) y muestra las métricas. No es una promesa de
+    rentabilidad real: es un smoke test de robustez de la configuración."""
+    from backtest.engine import quick_validation
+
+    strategy = settings.strategy
+    metrics = quick_validation(strategy, seeds=(7, 42, 2026), capital=settings.initial_capital)
+    print("\n" + "=" * 60)
+    print(" BACKTEST OFFLINE — DATOS SINTÉTICOS")
+    print("=" * 60)
+    print(" (sin red ni API; solo validación de robustez de la configuración)")
+    print(" " + metrics.summary())
+    print("=" * 60 + "\n")
+
+
 async def _run_bot(settings: Settings) -> None:
     bot = TradingBot(settings)
 
@@ -229,12 +284,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Trading bot BTC/USDT & ETH/USDT sobre Binance")
     parser.add_argument("--report", action="store_true",
                          help="Genera report.csv/report.html a partir de logs existentes y termina")
+    parser.add_argument("--backtest", action="store_true",
+                         help="Valida la configuración con datos sintéticos OFFLINE (sin API ni créditos) y termina")
     args = parser.parse_args()
 
     settings = Settings.load()
 
     if args.report:
         _generate_report(settings)
+        return
+
+    if args.backtest:
+        _run_backtest_cli(settings)
         return
 
     asyncio.run(_run_bot(settings))

@@ -30,10 +30,11 @@ class OrderValidationError(Exception):
 
 
 class OrderManager:
-    def __init__(self, client: BinanceClient, logger: TradeLogger, trading_mode: str):
+    def __init__(self, client: BinanceClient, logger: TradeLogger, trading_mode: str, risk_manager=None):
         self.client = client
         self.logger = logger
         self.trading_mode = trading_mode  # "paper_trading" | "live_trading"
+        self.risk_manager = risk_manager
         self.positions: dict[str, Position] = {}  # symbol -> Position (una posición abierta por símbolo)
 
     @property
@@ -75,6 +76,9 @@ class OrderManager:
             stop_loss=decision.stop_loss,
             take_profit=decision.take_profit,
             entry_order_id=order_id,
+            atr_at_entry=decision.atr,
+            trail_atr_multiplier=decision.trail_atr_multiplier,
+            best_price_since_entry=entry_price,
         )
         self.positions[symbol] = position
 
@@ -126,6 +130,8 @@ class OrderManager:
         if position is None:
             return None
 
+        trailing_moved = self._update_trailing_stop(position, current_price)
+
         hit_stop = (
             (position.direction == SignalDirection.LONG and current_price <= position.stop_loss)
             or (position.direction == SignalDirection.SHORT and current_price >= position.stop_loss)
@@ -143,3 +149,37 @@ class OrderManager:
         if on_close:
             on_close(closed)
         return closed
+
+    def _update_trailing_stop(self, position: Position, current_price: float) -> bool:
+        """Ratchet del stop loss a favor de la posición usando ATR de entrada.
+        Devuelve True si el stop se movió. No dispara ninguna orden: solo
+        prepara el nivel; el disparo lo decide check_exit_conditions."""
+        if not position.trail_atr_multiplier or position.atr_at_entry is None:
+            return False
+        if self.risk_manager is None:
+            return False
+
+        if position.direction == SignalDirection.LONG:
+            position.best_price_since_entry = max(position.best_price_since_entry or position.entry_price, current_price)
+        else:
+            position.best_price_since_entry = min(position.best_price_since_entry or position.entry_price, current_price)
+
+        new_stop = self.risk_manager.update_trailing_stop(
+            current_price=position.best_price_since_entry,
+            entry_price=position.entry_price,
+            direction=position.direction,
+            stop_loss=position.stop_loss,
+            atr=position.atr_at_entry,
+            trail_multiplier=position.trail_atr_multiplier,
+        )
+
+        if abs(new_stop - position.stop_loss) > 1e-9:
+            self.logger.log_event("trailing_stop_updated", {
+                "symbol": position.symbol,
+                "stop_loss_from": position.stop_loss,
+                "stop_loss_to": new_stop,
+                "best_price": position.best_price_since_entry,
+            })
+            position.stop_loss = new_stop
+            return True
+        return False

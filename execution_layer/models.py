@@ -27,6 +27,10 @@ class Position:
     exit_price: float | None = None
     closed_at: datetime | None = None
     close_reason: str | None = None
+    # Trailing stop
+    atr_at_entry: float | None = None
+    trail_atr_multiplier: float | None = None
+    best_price_since_entry: float | None = None
 
     @property
     def pnl(self) -> float:
