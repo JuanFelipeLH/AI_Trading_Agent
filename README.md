@@ -1,0 +1,196 @@
+# Trading Bot — BTC/USDT & ETH/USDT (Binance)
+
+Bot de trading algorítmico con arquitectura por capas (datos, señales, riesgo,
+ejecución), pensado para correr contra **Binance Spot Testnet** y, mediante
+configuración, también contra producción.
+
+## Arquitectura
+
+```
+trading_bot/
+├── main.py                          # orquestador: data -> signal -> risk -> execution
+├── config/
+│   ├── settings.py                  # carga .env + strategy_config.yaml
+│   └── strategy_config.yaml         # símbolos, timeframes, indicadores, riesgo, ejecución
+├── data_layer/
+│   ├── binance_client.py            # ccxt async, testnet/live, reintentos
+│   └── models.py                    # MarketData
+├── signal_layer/
+│   ├── base_provider.py             # BaseSignalProvider (contrato) + Signal
+│   └── technical_provider.py        # TechnicalAnalysisProvider (RSI+MACD+EMA+S/R)
+├── risk_layer/
+│   └── risk_manager.py              # position sizing, SL/TP, circuit breaker
+├── execution_layer/
+│   ├── order_manager.py             # apertura/cierre de posiciones
+│   └── models.py                    # Position
+└── utils/
+    └── logger.py                    # log JSONL + dashboard + reporte CSV/HTML
+```
+
+**Extensibilidad de señales**: cualquier estrategia nueva (API externa,
+modelo de ML, sentiment, etc.) se añade creando una clase que hereda de
+`BaseSignalProvider` e implementa `generate_signal(market_data) -> Signal`.
+Ni `risk_layer` ni `execution_layer` necesitan cambios.
+
+## Estrategia
+
+- Timeframe principal **1h** (tendencia vía EMA50/EMA200 + momentum RSI/MACD),
+  confirmado con **15m**.
+- Riesgo máximo **2% del capital** por operación (`risk.risk_per_trade_pct`).
+- Stop loss configurable: **ATR** (`atr_multiplier x ATR14`) o **porcentaje fijo**.
+- Take profit con ratio riesgo:beneficio configurable (**1:2** por defecto).
+- **Circuit breaker**: el bot deja de operar si acumula más de 3 pérdidas
+  consecutivas (`risk.max_consecutive_losses`), hasta que se reinicie manualmente.
+- Todos los parámetros están en [config/strategy_config.yaml](config/strategy_config.yaml).
+
+## Instalación
+
+```bash
+cd trading_bot
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edita .env con tus credenciales de Binance Testnet:
+# https://testnet.binance.vision/ -> genera API_KEY / API_SECRET
+```
+
+`.env`:
+
+```
+API_KEY=tu_api_key_de_testnet
+API_SECRET=tu_api_secret_de_testnet
+USE_TESTNET=true
+TRADING_MODE=paper_trading   # paper_trading (simula) | live_trading (envía órdenes reales)
+INITIAL_CAPITAL=10000
+LOG_LEVEL=INFO
+```
+
+## Uso
+
+### Opción A: configuración interactiva por campaña (recomendado)
+
+```bash
+python start_bot.py
+```
+
+Pregunta capital inicial, meta de rentabilidad, perfil de riesgo, activos y
+timeframe; guarda la respuesta en `config/session_config.json` y arranca el
+bot con esa configuración. Esa sesión:
+
+- Sobreescribe símbolos, timeframe principal (la confirmación se ajusta sola,
+  p.ej. `1h` -> `15m`), riesgo por trade y frecuencia de consulta de
+  `strategy_config.yaml` para esta campaña.
+- Activa un `CampaignTracker` (`risk_layer/campaign_tracker.py`): un circuit
+  breaker a nivel de campaña completa, independiente del circuit breaker por
+  pérdidas consecutivas de `RiskManager`. El bot **deja de abrir posiciones
+  automáticamente** en cuanto el equity (capital inicial + PnL acumulado)
+  alcanza la meta de rentabilidad o cae por debajo del drawdown máximo
+  definido.
+- El modo de ejecución es siempre automático: el proveedor de señales
+  decide, `RiskManager` valida/dimensiona cada orden, el bot ejecuta. No hay
+  modos semi-automático (aprobar cada trade a mano) ni manual (solo opinión)
+  — quedan fuera de alcance por ahora.
+- Las "notificaciones" son las que ya existen: `logs/trades.jsonl` +
+  dashboard en consola en cada ciclo; no hay integración con Telegram/email.
+
+Para repetir la misma campaña en un reinicio, vuelve a correr `python main.py`
+directamente: si `config/session_config.json` existe, se reutiliza
+automáticamente. Bórralo (o corre `start_bot.py` de nuevo) para volver al
+comportamiento sin campaña (corre indefinidamente, capital fijo desde `.env`).
+
+### Opción B: arranque directo (sin meta de campaña)
+
+```bash
+python main.py
+```
+
+El bot:
+1. Descarga velas 1h/15m de BTC/USDT y ETH/USDT en cada ciclo (`execution.poll_interval_seconds`).
+2. Genera una señal con `TechnicalAnalysisProvider`.
+3. La valida y dimensiona con `RiskManager` (2% de riesgo, SL/TP calculados).
+4. Si se aprueba, abre la posición (simulada en `paper_trading`, real en `live_trading`).
+5. En cada ciclo revisa si el precio tocó el stop loss o el take profit de las posiciones abiertas.
+6. Al cerrar una posición, suma el PnL al capital (`self.capital`) — el position sizing del
+   siguiente trade ya refleja ganancias/pérdidas acumuladas, no queda fijo en `INITIAL_CAPITAL`.
+7. Registra cada paso en `logs/trades.jsonl` y muestra un dashboard en consola.
+
+Generar un reporte CSV/HTML a partir del histórico de operaciones (sin arrancar el bot):
+
+```bash
+python main.py --report
+```
+
+Esto produce `report.csv` y `report.html` con todas las operaciones cerradas.
+
+## Proveedor de señales opcional: Venice.ai (LLM)
+
+Además de `TechnicalAnalysisProvider`, existe `signal_layer/venice_provider.py`:
+un `VeniceSignalProvider` que le pide a un modelo servido por Venice.ai que
+decida LONG/SHORT/HOLD, usando los indicadores técnicos (RSI, MACD, EMA,
+soporte/resistencia) como contexto del prompt.
+
+- **Desactivado por defecto** (`venice.enabled: false` en `strategy_config.yaml`).
+- Venice solo aporta **dirección y confianza**; el stop loss, take profit y
+  tamaño de posición los sigue calculando siempre `RiskManager` (2% de
+  riesgo, ATR, ratio 1:2) — igual que con cualquier otro proveedor.
+- Si la llamada a Venice falla, da timeout o responde algo no parseable, el
+  bot cae automáticamente a `TechnicalAnalysisProvider` para ese ciclo.
+- Mantiene un contexto persistido (`venice.context_file`, por defecto
+  `logs/venice_context.json`) con el historial de resultados, ya que el
+  modelo no tiene memoria entre llamadas: cada prompt incluye win rate,
+  racha actual y los últimos cierres.
+
+Para activarlo:
+
+```yaml
+# config/strategy_config.yaml
+venice:
+  enabled: true
+  model: openai-gpt-6-astra   # ya verificado contra GET /v1/models con esta cuenta
+```
+
+```bash
+# .env
+VENICE_API_KEY=tu_api_key_de_venice
+```
+
+Con la cadencia de `start_bot.py` ("60 min", ~48 llamadas/día entre BTC/USDT
+y ETH/USDT sin posición abierta) `openai-gpt-6-astra` cuesta ~$11.6/mes
+($10/$50 por millón de tokens entrada/salida) — asumible dado el propósito.
+Si en algún momento quieres bajar el gasto sin perder razonamiento, cambia
+`model` a `kimi-k2-5` (~$0.56/$3.50, ~$0.72/mes a esa misma cadencia) o
+`deepseek-v4-flash` (~$0.14/$0.275, aún más barato).
+
+**Usa siempre `start_bot.py` para arrancar el bot con Venice activo.** Si
+en cambio corrés `python main.py` directamente con `venice.enabled: true`
+pero sin haber generado antes `config/session_config.json`, se aplica el
+default genérico `execution.poll_interval_seconds: 60` (60 **segundos**, no
+minutos) — a esa cadencia serían ~2,880 llamadas/día y el costo se dispara a
+cientos de dólares al mes con cualquier modelo.
+
+**Importante**: la cuenta usada en las pruebas devolvió `402 Insufficient
+USD or Diem balance` al llamar al modelo — la key es válida y la conexión
+funciona, pero necesita crédito cargado en
+[venice.ai/settings/api](https://venice.ai/settings/api) antes de que
+cualquier modelo responda. Hasta entonces, `VeniceSignalProvider` seguirá
+cayendo automáticamente a `TechnicalAnalysisProvider` en cada ciclo (así lo
+verás en `logs/trades.jsonl`: `"source": "fallback_technical"`).
+
+## Pasar a producción
+
+1. Genera API keys reales en Binance (con permisos de trading, sin retiros).
+2. En `.env`: `USE_TESTNET=false`.
+3. Cuando estés seguro de la estrategia: `TRADING_MODE=live_trading`.
+4. Revisa `config/strategy_config.yaml` (símbolos, riesgo, `max_open_positions`, etc.) antes de operar con fondos reales.
+
+## Notas de diseño
+
+- El stop loss / take profit se gestionan por *polling* (comparando el precio
+  de cada ciclo contra los niveles calculados), no con una OCO nativa del
+  exchange, para mantener el código simple y portable. Para uso intensivo en
+  producción se recomienda migrar a órdenes OCO/bracket nativas de Binance.
+- Los reintentos ante errores de red/API usan backoff exponencial (`tenacity`),
+  configurables en `api.max_retries` / `api.retry_backoff_seconds`.
+# AI_Trading_Agent
